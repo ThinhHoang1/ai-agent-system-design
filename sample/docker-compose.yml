@@ -1,0 +1,76 @@
+# Three relay replicas behind no load balancer (the burst script and the mock tenant
+# spread calls across them), one RabbitMQ, one Postgres, plus mock tenant and provider.
+# Host ports use the 18xxx/55xxx range to avoid clashing with anything you already run.
+
+x-relay: &relay
+  build: .
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    rabbitmq: { condition: service_healthy }
+  environment: &relay-env
+    ROLE: relay
+    DATABASE_URL: postgres://app:app@postgres:5432/app
+    AMQP_URL: amqp://guest:guest@rabbitmq:5672
+    TENANT_URL: http://tenant:8080
+    PROVIDER_URL: http://provider:8080
+    BUCKETS: "32"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: app }
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 2s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports: ["55672:5672", "15673:15672"] # management UI: http://localhost:15673 (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      retries: 40
+
+  relay1: { <<: *relay, environment: { <<: *relay-env, REPLICA_ID: relay1 }, ports: ["18081:8080"] }
+  relay2: { <<: *relay, environment: { <<: *relay-env, REPLICA_ID: relay2 }, ports: ["18082:8080"] }
+  relay3: { <<: *relay, environment: { <<: *relay-env, REPLICA_ID: relay3 }, ports: ["18083:8080"] }
+
+  tenant:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      ROLE: tenant
+      REPLICA_ID: tenant
+      DATABASE_URL: postgres://app:app@postgres:5432/app
+      RELAY_URLS: http://relay1:8080,http://relay2:8080,http://relay3:8080
+      TENANT_FAIL_RATE: ${TENANT_FAIL_RATE:-0.05}
+      TENANT_DUP_SEND_RATE: ${TENANT_DUP_SEND_RATE:-0.1}
+    ports: ["18090:8080"]
+
+  provider:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      ROLE: provider
+      REPLICA_ID: provider
+      DATABASE_URL: postgres://app:app@postgres:5432/app
+      PROVIDER_5XX_RATE: ${PROVIDER_5XX_RATE:-0.1}
+      PROVIDER_4XX_RATE: ${PROVIDER_4XX_RATE:-0.02}
+    ports: ["18091:8080"]
+
+  # One-off runner for the scripts: docker compose run --rm tools npm run burst
+  tools:
+    build: .
+    profiles: ["tools"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/app
+      RELAY_URLS: http://relay1:8080,http://relay2:8080,http://relay3:8080
